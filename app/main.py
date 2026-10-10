@@ -9,6 +9,8 @@ Contract: openapi.yaml (paths, status codes, business rules R1-R10). Storage: DA
 import calendar
 import json
 import os
+import threading
+import time as clock
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -21,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
 
 load_dotenv()  # override=False: real environment variables take priority over .env
 
@@ -51,9 +53,27 @@ def ensure_indexes() -> None:
     db.attendance_logs.create_index([("emp_code", ASCENDING), ("punch_in", DESCENDING)])
 
 
+indexes_ready = threading.Event()
+
+
+def _ensure_indexes_until_reachable() -> None:
+    while not indexes_ready.is_set():
+        try:
+            ensure_indexes()
+            indexes_ready.set()
+        except ConnectionFailure:
+            clock.sleep(1)  # each attempt already waits serverSelectionTimeoutMS
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    ensure_indexes()
+    # If MongoDB is unreachable at boot, start anyway and keep retrying in the background (/health stays 503 until the
+    # indexes exist) instead of crashing. Any other error (e.g. duplicates blocking a unique index) fails startup.
+    try:
+        ensure_indexes()
+        indexes_ready.set()
+    except ConnectionFailure:
+        threading.Thread(target=_ensure_indexes_until_reachable, daemon=True).start()
     yield
 
 
@@ -307,6 +327,8 @@ def health():
         client.admin.command("ping")
     except PyMongoError:
         raise HTTPException(503, "database unavailable")
+    if not indexes_ready.is_set():
+        raise HTTPException(503, "starting: indexes not created yet")
     return {"status": "ok"}
 
 
