@@ -502,6 +502,7 @@ def _valid_month(value: str) -> str:
 Month = Annotated[str, Query(pattern=r"^[0-9]{4}-(0[1-9]|1[0-2])$"), AfterValidator(_valid_month)]
 Limit = Annotated[int, Query(ge=1, le=50)]
 MAX_TREND_DAYS = 92
+MAX_INT64 = 2**63 - 1
 
 IS_PRESENT = {"$in": ["$status", list(PRESENCE_STATUSES)]}
 PRESENT_VALUE = {"$cond": [IS_PRESENT, {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1]}, 0]}  # R5, R6
@@ -822,7 +823,7 @@ def explain_endpoint(
             "find": collection,
             "filter": build_attendance_query(emp_code, date_from, date_to, status),
             "sort": dict(ATTENDANCE_SORT),
-            "skip": (page - 1) * page_size,
+            "skip": min((page - 1) * page_size, MAX_INT64),  # a page far past the end must not overflow BSON
             "limit": page_size,
         }
     else:
