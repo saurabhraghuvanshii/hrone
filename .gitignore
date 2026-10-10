@@ -10,3 +10,4 @@ venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+docker-compose.yml
