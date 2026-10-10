@@ -7,12 +7,14 @@ Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience; real environm
 Contract: openapi.yaml (paths, status codes, business rules R1-R10). Storage: DATA_MODEL.md.
 """
 import calendar
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
+from bson import json_util
 from bson.decimal128 import Decimal128
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -761,6 +763,61 @@ def department_trend(
 
 
 # --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
+# Admin: explain
 # --------------------------------------------------------------------------- #
+ExplainTarget = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard",
+                        "department_trend"]
+
+
+def require(**params) -> None:
+    """422 (FastAPI's validation body) for parameters the explained endpoint requires."""
+    missing = [name for name, value in params.items() if value is None]
+    if missing:
+        raise RequestValidationError([
+            {"type": "missing", "loc": ("query", name), "msg": "Field required", "input": None} for name in missing
+        ])
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainTarget,
+    emp_code: Optional[str] = None,
+    month: Optional[Month] = None,
+    department: Optional[str] = None,
+    limit: Limit = 10,
+    date_from: Optional[DateStr] = None,
+    date_to: Optional[DateStr] = None,
+    status: Optional[Status] = None,
+    trend_from: Annotated[Optional[DateStr], Query(alias="from")] = None,
+    trend_to: Annotated[Optional[DateStr], Query(alias="to")] = None,
+    page: Page = 1,
+    page_size: PageSize = 20,
+):
+    """Explains the endpoint's main query, built by the same builder the endpoint uses."""
+    if endpoint == "attendance_list":
+        collection = "attendance_logs"
+        command = {
+            "find": collection,
+            "filter": build_attendance_query(emp_code, date_from, date_to, status),
+            "sort": dict(ATTENDANCE_SORT),
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
+        }
+    else:
+        if endpoint == "employee_monthly":
+            require(emp_code=emp_code, month=month)
+            collection, pipeline = "attendance_logs", build_employee_monthly(emp_code, month)
+        elif endpoint == "department_summary":
+            require(month=month)
+            collection, pipeline = "employees", build_department_summary(month, department)
+        elif endpoint == "late_leaderboard":
+            require(month=month)
+            collection, pipeline = "attendance_logs", build_late_leaderboard(month, limit, department)
+        else:
+            require(department=department, **{"from": trend_from, "to": trend_to})
+            collection, pipeline = "attendance_logs", build_department_trend(department, trend_from, trend_to)
+        command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+    result = db.command({"explain": command, "verbosity": "executionStats"})
+    # Relaxed Extended JSON: Int64, Decimal128, dates and timestamps become plain JSON.
+    explain = json.loads(json_util.dumps(result, json_options=json_util.RELAXED_JSON_OPTIONS))
+    return {"endpoint": endpoint, "collection": collection, "explain": explain}

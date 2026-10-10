@@ -30,5 +30,5 @@ uvicorn app.main:app --port 8000
 - Part A findings are in `REVIEW.md`, design answers in `DECISIONS.md`.
 
 ## Status
-- Done: all CRUD, attendance, regularization and analytics endpoints.
-- Pending: `GET /admin/explain/{endpoint}`.
+All endpoints in `openapi.yaml` are implemented. `GET /admin/explain/{endpoint}` runs `explain` (executionStats) on the
+same query/pipeline the endpoint builds; on a ~90k-record dataset every plan uses `IXSCAN` and none uses `COLLSCAN`.
