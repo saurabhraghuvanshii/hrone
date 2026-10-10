@@ -1,0 +1,12 @@
+# local planning / AI tooling (not part of the submission)
+.plan/
+CLAUDE.md
+.claude/
+
+# environment & build artefacts
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
