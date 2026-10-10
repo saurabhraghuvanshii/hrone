@@ -135,6 +135,22 @@ def derived_fields(status: str, punch_in: Optional[datetime], punch_out: Optiona
     return fields
 
 
+TRACKED_FIELDS = ("status", "punch_in", "punch_out", "work_hours", "late_minutes", "overtime_minutes", "half_day")
+
+
+def record_state(doc: dict) -> dict:
+    """The audited fields of a stored record, with legacy gaps defaulted (missing punch/derived values)."""
+    return {
+        "status": doc["status"],
+        "punch_in": doc.get("punch_in"),
+        "punch_out": doc.get("punch_out"),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes") or 0,
+        "overtime_minutes": doc.get("overtime_minutes") or 0,
+        "half_day": bool(doc.get("half_day") or False),
+    }
+
+
 def _api_value(value):
     return to_ms(value) if isinstance(value, datetime) else value
 
@@ -249,6 +265,15 @@ class PunchOutIn(RequestModel):
     punched_at: Optional[EpochMs] = None
 
 
+class RegularizeIn(RequestModel):
+    """Only these fields can be corrected; derived fields sent by a client are ignored."""
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: Annotated[str, Field(min_length=5, max_length=200)]
+    regularized_by: Annotated[str, Field(min_length=1, max_length=50)]
+
+
 # --------------------------------------------------------------------------- #
 # Query builders (shared by the endpoints and /admin/explain)
 # --------------------------------------------------------------------------- #
@@ -333,31 +358,91 @@ def punch_out(body: PunchOutIn):
     if emp is None:
         raise HTTPException(404, "employee not found")
     ts = from_ms(body.punched_at) if body.punched_at is not None else now_utc()
-    # Latest punch-in at or before ts, so an overnight shift is found across midnight ((emp_code, punch_in) index).
-    record = db.attendance_logs.find_one(
-        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}}, sort=[("punch_in", DESCENDING)]
-    )
+    for _ in range(3):
+        # Latest punch-in at or before ts, so an overnight shift is found across midnight ((emp_code, punch_in) index).
+        record = db.attendance_logs.find_one(
+            {"emp_code": body.emp_code, "punch_in": {"$lte": ts}}, sort=[("punch_in", DESCENDING)]
+        )
+        if record is None:
+            raise HTTPException(404, "no punch-in found")
+        if record.get("punch_out") is not None:
+            raise HTTPException(409, "already punched out")
+        if ts <= record["punch_in"] or ts - record["punch_in"] > timedelta(hours=24):
+            raise validation_error(("body", "punched_at"), "punch-out must be after punch-in and within 24 hours",
+                                   body.punched_at)
+        derived = derived_fields(record["status"], record["punch_in"], ts, record["date"], emp)
+        # Compare-and-set on everything the computation read: of two concurrent punch-outs only one still sees
+        # punch_out == null, and a correction that moved punch_in in between makes us re-read instead of writing
+        # derived values computed from the old punch_in.
+        updated = db.attendance_logs.find_one_and_update(
+            {"_id": record["_id"], "punch_out": None, "punch_in": record["punch_in"], "status": record["status"]},
+            {"$set": {
+                "punch_out": ts,
+                "work_hours": derived["work_hours"],
+                "overtime_minutes": derived["overtime_minutes"],
+                "half_day": derived["half_day"],
+            }},
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated is not None:
+            return serialize_record(updated)
+    raise HTTPException(409, "record was modified concurrently; retry")
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: DateStr, body: RegularizeIn):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
     if record is None:
-        raise HTTPException(404, "no punch-in found")
-    if record.get("punch_out") is not None:
-        raise HTTPException(409, "already punched out")
-    if ts <= record["punch_in"] or ts - record["punch_in"] > timedelta(hours=24):
-        raise validation_error(("body", "punched_at"), "punch-out must be after punch-in and within 24 hours",
-                               body.punched_at)
-    derived = derived_fields(record["status"], record["punch_in"], ts, record["date"], emp)
-    # Conditional update: of two concurrent punch-outs only one still sees punch_out == null.
+        raise HTTPException(404, "no attendance record for this date")
+
+    def invalid(field: str, msg: str):
+        return validation_error(("body", field), msg, getattr(body, field, None))
+
+    status = body.status or record["status"]
+    if status in PRESENCE_STATUSES:
+        punch_in = from_ms(body.punch_in) if body.punch_in is not None else record.get("punch_in")
+        punch_out = from_ms(body.punch_out) if body.punch_out is not None else record.get("punch_out")
+        if punch_in is None:
+            raise invalid("punch_in", f"status {status} requires a punch_in")
+        if body.punch_in is not None and attendance_date(punch_in, emp) != date:
+            raise invalid("punch_in", "punch_in must stay on the record's attendance date")
+        if punch_out is not None and not (punch_in < punch_out <= punch_in + timedelta(hours=24)):
+            raise invalid("punch_out", "punch_out must be after punch_in and within 24 hours")
+    else:
+        if body.punch_in is not None or body.punch_out is not None:
+            raise invalid("status", f"status {status} clears punch times; do not send punch_in/punch_out")
+        punch_in = punch_out = None
+
+    before = record_state(record)
+    after = {"status": status, "punch_in": punch_in, "punch_out": punch_out,
+             **derived_fields(status, punch_in, punch_out, date, emp)}
+    if all(after[f] == before[f] for f in ("status", "punch_in", "punch_out")):
+        raise invalid("status", "the request changes nothing")
+
+    entry = {
+        "at": now_utc(),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": {f: {"from": before[f], "to": after[f]} for f in TRACKED_FIELDS if after[f] != before[f]},
+    }
+    # Optimistic lock: the write only applies if the record is still exactly as read (same editable fields and
+    # history length). A concurrent punch-out or correction makes this match nothing -> 409, never a lost entry.
     updated = db.attendance_logs.find_one_and_update(
-        {"_id": record["_id"], "punch_out": None},
-        {"$set": {
-            "punch_out": ts,
-            "work_hours": derived["work_hours"],
-            "overtime_minutes": derived["overtime_minutes"],
-            "half_day": derived["half_day"],
-        }},
+        {
+            "_id": record["_id"],
+            "status": record["status"],
+            "punch_in": record.get("punch_in"),
+            "punch_out": record.get("punch_out"),
+            "$expr": {"$eq": [{"$size": {"$ifNull": ["$history", []]}}, len(record.get("history") or [])]},
+        },
+        {"$set": after, "$push": {"history": entry}},
         return_document=ReturnDocument.AFTER,
     )
     if updated is None:
-        raise HTTPException(409, "already punched out")
+        raise HTTPException(409, "record was modified concurrently; retry")
     return serialize_record(updated)
 
 
@@ -382,7 +467,6 @@ def list_attendance(
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
