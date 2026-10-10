@@ -11,4 +11,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 docker-compose.yml
-tests
+tests/
+requirements-dev.txt
