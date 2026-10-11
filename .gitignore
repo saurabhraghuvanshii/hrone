@@ -13,3 +13,11 @@ __pycache__/
 docker-compose.yml
 tests/
 requirements-dev.txt
+
+# personal interview notes
+INTERVIEW_PREP.md
+PROBLEM_STATEMENT.md
+sample_seed.py
+sample_data/
+DATA_MODEL.md
+openapi.yaml
